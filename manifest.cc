@@ -17,6 +17,7 @@
 
 #include <boost/utility/string_ref.hpp>
 #include <boost/asio.hpp>
+#include <boost/bind.hpp>
 #include <boost/asio/spawn.hpp>
 #include <boost/program_options.hpp>
 #include <rocksdb/db.h>
@@ -138,8 +139,9 @@ std::optional<Digest> fiemap_hash(int fd) {
       }
       struct __attribute__((packed)) {
         uint64_t physical;
+        uint64_t logical;
         uint64_t length;
-      } packed_extent = {extent.fe_physical, extent.fe_length};
+      } packed_extent = {extent.fe_physical, extent.fe_logical, extent.fe_length};
       ctx.update((uint8_t*)&packed_extent, sizeof(packed_extent));
       if (extent.fe_flags & FIEMAP_EXTENT_LAST) {
         return ctx.digest();
@@ -271,13 +273,17 @@ class Manifest {
   std::atomic<bool> interrupted = false;
   bool finished_scan = false;
   Stats stats;
+  int term_width;
 
   typedef BOOST_ASIO_HANDLER_TYPE(asio::yield_context, void(void)) SemHandler;
   typedef asio::executor_work_guard<asio::io_service::executor_type> Guard;
   std::optional<SemHandler> sem_handler;
   std::optional<Guard> sem_handler_guard;
 
+  asio::signal_set sigusr1{io, SIGUSR1}, sigwinch{io, SIGWINCH};
+
   ~Manifest() {
+    pool.join();
     if (by_fiemap_cf) {
       delete by_fiemap_cf;
     }
@@ -292,6 +298,8 @@ class Manifest {
   Manifest(const std::string &db_path)
     : pool(std::thread::hardware_concurrency())
   {
+    get_width();
+
     initial_limit_count = limit_count = std::thread::hardware_concurrency() * 3;
 
     mounts = mnt_new_table_from_file("/proc/self/mountinfo");
@@ -311,7 +319,7 @@ class Manifest {
     descriptors.push_back(
       rocksdb::ColumnFamilyDescriptor(rocksdb::kDefaultColumnFamilyName, colopts));
     descriptors.push_back(
-      rocksdb::ColumnFamilyDescriptor("by_fiemap", colopts));
+      rocksdb::ColumnFamilyDescriptor("by_fiemap_v2", colopts));
     std::vector<rocksdb::ColumnFamilyHandle*> handles;
 
     auto status = rocksdb::DB::Open(opts, db_path, descriptors, &handles, &db);
@@ -367,9 +375,7 @@ class Manifest {
                 newline_if_needed();
                 printf("can't use fiemap for %s\n", entry_path.c_str());
               }
-              clearline();
-              printf("... %s", entry_path.c_str());
-              fflush(stdout);
+              print_status(entry_path);
             }
             sempost();
             if (finished_scan && limit_count == initial_limit_count) {
@@ -379,6 +385,15 @@ class Manifest {
         });
       }
     }
+  }
+
+  void print_status(boost::string_ref path) {
+    clearline();
+    if (path.length() + 5 > term_width) {
+      path = path.substr(path.length() + 5 - term_width);
+    }
+    printf("... %s", path.data());
+    fflush(stdout);
   }
 
   void semwait(asio::yield_context yield) {
@@ -408,9 +423,23 @@ class Manifest {
     }
   }
 
+
+  void handle_sigusr1(const boost::system::error_code &ec, int signal) {
+    assert(!ec);
+    print_status();
+    sigusr1.async_wait(boost::bind(&Manifest::handle_sigusr1, this, _1, _2));
+  }
+
+  void handle_sigwinch(const boost::system::error_code &ec, int signal) {
+    assert(!ec);
+    newline_if_needed();
+    get_width();
+    sigwinch.async_wait(boost::bind(&Manifest::handle_sigwinch, this, _1, _2));
+  }
+
   void scanDir(const fs::path &path) {
-    asio::signal_set signals(io, SIGINT);
-    signals.async_wait([=](const boost::system::error_code &ec, int signal){
+    asio::signal_set sigint(io, SIGINT);
+    sigint.async_wait([=](const boost::system::error_code &ec, int signal){
       assert(!ec);
       interrupted = true;
       newline_if_needed();
@@ -418,6 +447,8 @@ class Manifest {
       io.stop();
       pool.stop();
     });
+    sigusr1.async_wait(boost::bind(&Manifest::handle_sigusr1, this, _1, _2));
+    sigwinch.async_wait(boost::bind(&Manifest::handle_sigwinch, this, _1, _2));
     asio::spawn(io, [&](asio::yield_context yield) {
       visitDir(path, yield);
       finished_scan = true;
@@ -438,11 +469,25 @@ class Manifest {
       printf("finished cleanup\n");
     }
 
+    print_status();
+  }
+
+  void print_status() {
+    newline_if_needed();
     printf("total files = %ld\n", stats.num_files);
     printf("found by fiemap = %ld\n", stats.found_by_fiemap);
     printf("couldn't use fiemap = %ld\n", stats.couldnt_use_fiemap);
     printf("files already in database = %ld\n", stats.found_in_db);
     printf("files added to database = %ld\n", stats.num_files - stats.found_in_db);
+  }
+
+  void get_width() {
+    struct winsize w;
+    int r = ioctl(1, TIOCGWINSZ, &w);
+    if (r < 0) {
+      throw std::runtime_error("couldn't get terminal width");
+    }
+    term_width = w.ws_col;
   }
 
   void newline_if_needed() {
