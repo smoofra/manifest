@@ -12,7 +12,7 @@
 #include <optional>
 #include <filesystem>
 #include <exception>
-//#include <semaphore.h>
+#include <optional>
 //#include <btrfs/ioctl.h>
 
 #include <boost/utility/string_ref.hpp>
@@ -68,6 +68,13 @@ public:
     MD5(buffer, length, digest);
   }
 
+  Digest(rocksdb::Slice slice) {
+    if (slice.size() != length) {
+      throw std::runtime_error("digest is wrong length");
+    }
+    memcpy(digest, slice.data(), length);
+  }
+
   static Digest fromBinary(const std::string &string) {
     if (string.length() != length) {
       throw std::runtime_error("digest is wrong length");
@@ -94,6 +101,10 @@ public:
 
   bool operator== (const Digest &other) const {
     return memcmp(digest, other.digest, length) == 0;
+  }
+
+  bool operator!= (const Digest &other) const {
+    return !(*this == other);
   }
 
   std::string hex() const {
@@ -559,37 +570,447 @@ class Manifest {
   }
 };
 
+struct ManifestIter {
 
-int main(int argc, char**argv) { 
+  rocksdb::DB *db = nullptr;
+  rocksdb::Iterator *iter = nullptr;
+  std::string prefix;
+  rocksdb::Slice _key;
 
-  try { 
-    po::options_description opts("options");
-
-    opts.add_options()
-      ("help,h", "print help")
-      ("db", po::value<std::string>(), "database path")
-      ("root", po::value<std::string>(), "directory to scan");
-
-    po::positional_options_description posopts;
-
-    po::variables_map vm;
-    po::store(po::command_line_parser(argc,argv).options(opts).positional(posopts).run(), vm);
-
-    if (vm.count("help") || !vm.count("db") || !vm.count("root")) {
-      std::cout << opts << std::endl;
-      return 1;
+  ~ManifestIter() {
+    if (iter) {
+      delete iter;
     }
+    if (db) {
+      delete db;
+    }
+  }
 
-    auto dbpath = vm["db"].as<std::string>();
-    auto rootpath = vm["root"].as<std::string>();
+  static std::string remove_suffix(const std::string &s, const std::string &suffix) {
+    size_t n = suffix.length();
+    if (s.length() >= n && s.substr(s.length() - n) == suffix) {
+      return s.substr(0, s.length() - n);
+    } else {
+      return s;
+    }
+  }
 
-    Manifest manifest(dbpath);
-    manifest.scanDir(Realpath(rootpath.c_str()));
+  ManifestIter(const std::string &db_path, const std::string &pfx)
+  {
+    prefix = fs::path(pfx).lexically_normal().string();
+    prefix = remove_suffix(prefix, "/.");
+    prefix = remove_suffix(prefix, "/");
+    auto opts = rocksdb::Options();
+    auto status = rocksdb::DB::OpenForReadOnly(opts, db_path, &db);
+    raise_for_status(status);
+    iter = db->NewIterator(rocksdb::ReadOptions());
+    iter->SeekToFirst();
+    fixup();
+  }
 
-  } catch (std::exception &e) { 
-    std::cout << e.what() << std::endl;
+  bool valid () const {
+    return iter->Valid();
+  }
+
+  void fixup() {
+    while (iter->Valid()) {
+      _key = iter->key();
+      if (_key.starts_with(prefix)) {
+        _key.remove_prefix(prefix.length());
+        return;
+      }
+      iter->Next();
+    }
+    _key = rocksdb::Slice();
+  }
+
+  void next() {
+    iter->Next();
+    fixup();
+  }
+
+  Digest value() const {
+    return Digest(iter->value());
+  }
+
+  rocksdb::Slice key() const {
+    return _key;
+  }
+
+};
+
+// asumes path is already lexically normalized.
+// no foo////bar or foo/./bar or foo/bar/ nonsense.
+std::string_view dirname(std::string_view path) {
+  if (path.length() == 0) {
+    throw std::runtime_error("dirname of empty string");
+  }
+  auto i = path.rfind('/');
+  if (i == std::string_view::npos) {
+    throw std::runtime_error("dirname on path with no /");
+  }
+  if (i == 0) {
+    if (path.length() == 1) {
+      throw std::runtime_error("dirname of root directory");
+    }
+    return "/";
+  } else if (i == path.length() - 1) {
+    throw std::runtime_error("dirname on non-normalized path");
+  } else {
+    return path.substr(0, i);
+  }
+}
+
+// common prefix of strings.
+std::string_view common_prefix(std::string_view a, std::string_view b) {
+  size_t min = std::min(a.length(), b.length());
+  if (min == 0 || a[0] != b[0]) {
+    return "";
+  }
+  for (size_t i = 1; i < min; i++) {
+    if (a[i] != b[i]) {
+      return a.substr(0, i-1);
+    }
+  }
+  return a.substr(0, min);
+}
+
+bool dirbreak_at(std::string_view a, size_t i) {
+  return i == a.length() || i < a.length() && a[i] == '/';
+}
+
+// common prefix of paths.   Assumes lexically normalized.
+// returns a lexically normalized path to a common parent directory
+std::string_view common_path_prefix(std::string_view a, std::string_view b) {
+  std::string_view prefix = common_prefix(a, b);
+  if (dirbreak_at(a, prefix.length()) && dirbreak_at(b, prefix.length())) {
+    return prefix;
+  } else {
+    return dirname(prefix);
+  }
+}
+
+// Represents one bound of an open interval on the ordered space of paths
+// If bound is None then the bound is +∞ or -∞
+class PathBound {
+  public:
+  std::optional<std::string> bound;
+
+  PathBound() {
+  }
+
+  PathBound (const std::optional<std::string> &s) {
+    bound = s;
+  }
+
+  PathBound parent() const {
+    if (bound.has_value()) {
+      fs::path path(bound.value());
+      assert(path.has_parent_path());
+      return PathBound(path.parent_path());
+    }
+    return PathBound{};
+  }
+
+  void operator= (const std::optional<std::string> &s) {
+    bound = s;
+  }
+
+  std::string_view printable() {
+    if (bound.has_value()) {
+      return bound.value();
+    } else {
+      return "none";
+    }
+  }
+};
+
+bool operator< (PathBound b, std::string_view s) {
+  return !b.bound.has_value() || b.bound.value() < s;
+}
+
+bool operator< (std::string_view s, PathBound b) {
+    return !b.bound.has_value() || s < b.bound.value();
+}
+
+// represents the interval of all possible paths under a specific directory.
+struct DirInterval {
+  std::string_view path;
+  DirInterval(std::string_view path) : path(path) {};
+};
+
+bool operator<(PathBound bound, DirInterval dir) {
+  // the path of the directory itself is the minimum in the interval
+  return bound < dir.path;
+}
+
+// true if prefix+"/"  is a prefix of string
+bool is_path_prefix(std::string_view prefix, const std::optional<std::string> &string) {
+  if (!string.has_value()) {
+    return false;
+  }
+  if (prefix.length() + 1 >= string->length()) {
+    return false;
+  }
+  return string->substr(0, prefix.length()) == prefix && (*string)[prefix.length()] == '/';
+}
+
+bool operator<(DirInterval dir, PathBound bound) {
+  // we want to return true if "$dir/**" < bound for all **
+  return dir.path < bound && !is_path_prefix(dir.path, bound.bound);
+
+
+  // case dir < bound
+  //   case |dir| < |bound|
+  //       case prefix_|dir|(bound) == dir  FALSE
+  //       case prefix_|dir|(bound) < dir    IMPOSSIBLE
+  //       case prefix_|dir|(bound) > dir
+  //       like: dir: a/b/c/***
+  //           bound: a/b/d         TRUE
+  //   case |dir| = |bound|
+  //       like:
+  //       dir:   a/b/c/***
+  //       bound: a/b/d     TRUE
+  //   case |dir| > |bound|
+  //       dir:   a/b/c/***
+  //       bound: a/c         TRUE
+  // case dir >= bound
+  //     then dir/*** >= dir >= bound so FALSE
+}
+
+void diff(ManifestIter &a, ManifestIter &b, bool show_equal)
+{
+  struct Iter {
+    std::optional<std::string> prev;
+    ManifestIter &iter;
+    size_t count = 0;
+    Iter(ManifestIter &i) : iter{i} {};
+    rocksdb::Slice key() {
+      return iter.key();
+    }
+    Digest value() {
+      return iter.value();
+    }
+    bool valid() {
+      return iter.valid();
+    }
+    void advance() {
+      prev = iter.key().ToString();
+      count++;
+      iter.next();
+    }
+  };
+
+  Iter ai{a}, bi{b};
+  size_t match_count = 0;
+  size_t acount = 0, bcount = 0;
+
+  while (a.valid() || b.valid()) {
+    if (a.valid() && b.valid() && a.key() == b.key()) {
+      if (a.value() != b.value()) {
+        std::cout << "- " << a.key().ToString() << " " << a.value().hex() << std::endl;
+        std::cout << "+ " << b.key().ToString() << " " << b.value().hex() << std::endl;
+      } else if (show_equal) {
+        std::cout << "= " << a.key().ToString() << " " << a.value().hex() << std::endl;
+      }
+      match_count++;
+      ai.advance();
+      bi.advance();
+    } else {
+      // define (x,y) as (min(a,b), max(a,b))
+      bool less;
+      if (!a.valid()) {
+        less = false;
+      } else if (!b.valid()) {
+        less = true;
+      } else {
+        less = a.key().ToStringView() < b.key().ToStringView();
+      }
+      Iter &x = less ? ai : bi;
+      Iter &y = less ? bi : ai;
+      char xlabel = less ? '-' : '+';
+      size_t &xcount = less ? acount : bcount;
+
+      // Y-side does not contain anything in this open interval (yleft, yright)
+      PathBound yleft = y.prev;
+      PathBound yright;
+      if (y.valid()) {
+        yright = y.key().ToString();
+      }
+
+      // The goal here is that if nothing under dirname(x) can possibly be in Y-side,
+      // then we lump them all together.
+      auto xdir = std::string{dirname(x.key().ToStringView())};
+      if (yleft < DirInterval(xdir) && DirInterval(xdir) < yright) {
+        std::string firstxdir = xdir, lastxdir = xdir;
+        size_t count = 1;
+        while (true) {
+          x.advance();
+          if (!x.valid()) {
+            break;
+          }
+          xdir = dirname(x.key().ToStringView());
+          if (DirInterval(common_path_prefix(firstxdir, xdir)) < yright) {
+            count++;
+            lastxdir = std::move(xdir);
+          } else {
+            break;
+          }
+        }
+        std::cout << xlabel << " " << common_path_prefix(firstxdir, lastxdir) << "/ " << count << " files." << std::endl;
+        xcount += count;
+      } else {
+        std::cout << xlabel << " " << x.key().ToString() << " " << x.value().hex() << std::endl;
+        xcount++;
+        x.advance();
+      }
+    }
+    std::cout << std::flush;
+  }
+  assert(!a.valid() && !b.valid());
+  assert(acount + bcount + 2 * match_count == ai.count + bi.count);
+}
+
+int main_scan(int argc, char **argv) {
+
+  po::options_description opts("options");
+
+  opts.add_options()
+    ("help,h", "print help")
+    ("db", po::value<std::string>(), "database path")
+    ("root", po::value<std::string>(), "directory to scan");
+
+  po::positional_options_description posopts;
+
+  po::variables_map vm;
+  po::store(po::command_line_parser(argc, argv).allow_unregistered().options(opts).positional(posopts).run(), vm);
+
+  if (vm.count("help") || !vm.count("db") || !vm.count("root")) {
+    std::cout << opts << std::endl;
     return 1;
   }
 
+  auto dbpath = vm["db"].as<std::string>();
+  auto rootpath = vm["root"].as<std::string>();
+
+  Manifest manifest(dbpath);
+  manifest.scanDir(Realpath(rootpath.c_str()));
+
   return 0;
+}
+
+int main_diff(int argc, char**argv)
+{
+  po::options_description opts("options");
+  opts.add_options()
+    ("help,h", "print help")
+    ("show-equal,e", "show files which match")
+    ("prefix-a", po::value<std::string>(), "prefix for database a")
+    ("prefix-b", po::value<std::string>(), "prefix for database b");
+
+  po::options_description hidden("hidden");
+  hidden.add_options()
+    ("db-a", po::value<std::string>(), "database path")
+    ("db-b", po::value<std::string>(), "database path");
+
+  po::options_description allopts;
+  allopts.add(opts);
+  allopts.add(hidden);
+
+  po::positional_options_description posopts;
+  posopts.add("db-a", 1);
+  posopts.add("db-b", 1);
+
+  po::variables_map vm;
+  po::store(po::command_line_parser(argc, argv)
+    .options(allopts).positional(posopts).run(), vm);
+
+  if (vm.count("help") || !vm.count("db-a") || !vm.count("db-b")) {
+    std::cout << "usage manifest scan DATABASE-A DATABASE-B ..." << std::endl;
+    std::cout << opts << std::endl;
+    return 1;
+  }
+
+  std::string prefixa;
+  if (vm.count("prefix-a")) {
+    prefixa = vm["prefix-a"].as<std::string>();
+  }
+  ManifestIter itera{vm["db-a"].as<std::string>(), prefixa};
+
+  std::string prefixb;
+  if (vm.count("prefix-b")) {
+    prefixb = vm["prefix-b"].as<std::string>();
+  }
+  ManifestIter iterb{vm["db-b"].as<std::string>(), prefixb};
+
+  diff(itera, iterb, vm.count("show-equal"));
+
+  return 0;
+}
+
+int main_list(int argc, char**argv)
+{
+  po::options_description opts("options");
+  opts.add_options()
+    ("help,h", "print help")
+    ("prefix", po::value<std::string>(), "path prefix prefix");
+
+  po::options_description hidden("hidden");
+  hidden.add_options()
+    ("db", po::value<std::string>(), "database path");
+
+  po::options_description allopts;
+  allopts.add(opts);
+  allopts.add(hidden);
+
+  po::positional_options_description posopts;
+  posopts.add("db", 1);
+
+  po::variables_map vm;
+  po::store(po::command_line_parser(argc, argv)
+    .options(allopts).positional(posopts).run(), vm);
+
+  if (vm.count("help") || !vm.count("db")) {
+    std::cout << "usage manifest list DATABASE ..." << std::endl;
+    std::cout << opts << std::endl;
+    return 1;
+  }
+
+  std::string prefix;
+  if (vm.count("prefix")) {
+    prefix = vm["prefix"].as<std::string>();
+  }
+  ManifestIter iter{vm["db"].as<std::string>(), prefix};
+
+  for (; iter.valid(); iter.next()) {
+    std::cout << iter.key().ToString() << " " << iter.value().hex() << std::endl;
+  }
+
+  return 0;
+}
+
+
+int main(int argc, char**argv) {
+  try {
+    std::string command;
+    if (argc >= 2) {
+      command = argv[1];
+    }
+    if (command != "scan" && command != "diff" && command != "list") {
+      std::cout << "usage manifest [scan | diff | list] ..." << std::endl;
+      return 1;
+    }
+    if (command == "scan") {
+      return main_scan(argc-1, argv+1);
+    }
+    if (command == "diff") {
+      return main_diff(argc-1, argv+1);
+    }
+    if (command == "list") {
+      return main_list(argc-1, argv+1);
+    }
+  } catch (std::exception &e) {
+    std::cout << e.what() << std::endl;
+    return 1;
+  }
 }
